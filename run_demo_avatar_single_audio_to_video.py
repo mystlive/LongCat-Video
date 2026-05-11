@@ -19,13 +19,13 @@ from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeli
 from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
 from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
+from longcat_video.modules.quantization import load_quantized_dit
 from longcat_video.context_parallel import context_parallel_util
 
 # -------- avatar related --------
 import librosa
-from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
+from longcat_video.audio_process import get_audio_encoder, get_audio_feature_extractor
 from longcat_video.audio_process.torch_utils import save_video_ffmpeg
-from transformers import Wav2Vec2FeatureExtractor
 from audio_separator.separator import Separator
 
 
@@ -64,12 +64,23 @@ def generate(args):
     resolution = args.resolution
     num_segments = max(1, args.num_segments)
     output_dir = args.output_dir
+    model_type = args.model_type
+    use_distill = args.use_distill
+    use_int8 = args.use_int8
+
+    if use_distill and model_type == "avatar-v1.5":
+        num_inference_steps = 8
+        text_guidance_scale = 1.0
+        audio_guidance_scale = 1.0
 
     # set up default inference params
     save_fps = 16
+    audio_stride = 2
+    if model_type == "avatar-v1.5":
+        save_fps = 25
+        audio_stride = 1
     num_frames = 93
     num_cond_frames = 13
-    audio_stride = 2
 
     if resolution == '480p':
         height, width = 480, 832
@@ -102,15 +113,37 @@ def generate(args):
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="tokenizer", torch_dtype=torch.bfloat16)
     text_encoder = UMT5EncoderModel.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="text_encoder", torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="vae", torch_dtype=torch.bfloat16)
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
-    dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_single", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+    if model_type == "avatar-v1.0":
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
+    elif model_type == "avatar-v1.5":
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler", torch_dtype=torch.bfloat16)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}. Expected 'avatar-v1.0' or 'avatar-v1.5'.")
+    
+    if model_type == "avatar-v1.0":
+        dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_single", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+    elif model_type == "avatar-v1.5":
+        if use_int8:
+            print("[INFO] Loading INT8 quantized DiT model...")
+            dit = load_quantized_dit(checkpoint_dir, subfolder="base_model_int8", cp_split_hw=cp_split_hw)
+        else:
+            dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="base_model", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+        if use_distill:
+            distill_checkpoint_path = os.path.join(checkpoint_dir, 'lora', f'dmd_lora.safetensors')
+            if os.path.exists(distill_checkpoint_path):
+                dit.load_lora(distill_checkpoint_path, "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+                dit.enable_loras(["dmd"])
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}. Expected 'avatar-v1.0' or 'avatar-v1.5'.")
     
     # initialize audio models
-    wav2vec_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')    
-    audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(local_rank)
-    audio_encoder.feature_extractor._freeze_parameters()
+    if model_type == "avatar-v1.0":
+        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')
+    elif model_type == "avatar-v1.5":
+        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'whisper-large-v3')
+    audio_encoder = get_audio_encoder(audio_model_checkpoint_path, model_type).to(local_rank)
+    audio_feature_extractor = get_audio_feature_extractor(audio_model_checkpoint_path, model_type)
 
-    wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path, local_files_only=True)
     vocal_separator_path = os.path.join(checkpoint_dir, 'vocal_separator/Kim_Vocal_2.onnx')
     audio_output_dir_temp = f"./audio_temp_file"
     os.makedirs(audio_output_dir_temp, exist_ok=True)
@@ -133,7 +166,8 @@ def generate(args):
         scheduler = scheduler,
         dit = dit,
         audio_encoder=audio_encoder,
-        wav2vec_feature_extractor=wav2vec_feature_extractor
+        audio_feature_extractor=audio_feature_extractor,
+        model_type=model_type
     )
     pipe.to(local_rank)
 
@@ -157,7 +191,7 @@ def generate(args):
             speech_array = np.append(speech_array, [0.]*added_sample_nums)
 
         # audio embedding
-        full_audio_emb = pipe.get_audio_embedding(speech_array, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr) 
+        full_audio_emb = pipe.get_audio_embedding(speech_array, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr, model_type=model_type)
         if torch.isnan(full_audio_emb).any():
             raise ValueError(f"broken audio embedding with nan values")
 
@@ -205,7 +239,8 @@ def generate(args):
             audio_guidance_scale=audio_guidance_scale,
             generator=generator,
             output_type='both',
-            audio_emb=audio_emb
+            audio_emb=audio_emb,
+            use_distill=use_distill,
         )
         output, latent = output_tuple 
         output = output[0] 
@@ -235,7 +270,8 @@ def generate(args):
             audio_guidance_scale=audio_guidance_scale,
             output_type='both',
             generator=generator,
-            audio_emb=audio_emb
+            audio_emb=audio_emb,
+            use_distill=use_distill,
         )
         output, latent = output_tuple
         output = output[0]
@@ -292,11 +328,12 @@ def generate(args):
             output_type='both',
             use_kv_cache=True,
             offload_kv_cache=False,
-            enhance_hf=True,
+            enhance_hf=True if not use_distill else False,
             audio_emb=audio_emb,
             ref_latent=ref_latent,
             ref_img_index=ref_img_index,
-            mask_frame_range=mask_frame_range
+            mask_frame_range=mask_frame_range,
+            use_distill=use_distill,
         )
         output, latent = output_tuple
 
@@ -378,6 +415,20 @@ def _parse_args():
         "--checkpoint_dir",
         type=str,
         default="./weights/LongCat-Video-Avatar",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="avatar-v1.0",
+    )
+    parser.add_argument(
+        "--use_distill",
+        action='store_true',
+    )
+    parser.add_argument(
+        "--use_int8",
+        action='store_true',
+        help="Load INT8 quantized DiT model for reduced VRAM usage"
     )
 
     args = parser.parse_args()

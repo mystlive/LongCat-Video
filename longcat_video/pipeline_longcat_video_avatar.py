@@ -27,8 +27,6 @@ import html
 # -------- avatar related --------
 import scipy.signal as ss
 import pyloudnorm as pyln
-from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
-from transformers import Wav2Vec2FeatureExtractor
 from diffusers.image_processor import is_valid_image, is_valid_image_imagelist
 import warnings
 
@@ -120,8 +118,9 @@ class LongCatVideoAvatarPipeline:
         vae: AutoencoderKLWan,
         scheduler: FlowMatchEulerDiscreteScheduler,
         dit: LongCatVideoAvatarTransformer3DModel,
-        audio_encoder: Wav2Vec2ModelWrapper,
-        wav2vec_feature_extractor: Wav2Vec2FeatureExtractor
+        audio_encoder = None,
+        audio_feature_extractor = None,
+        model_type="avatar-v1.0",
     ):
         self.vae = vae
         self.text_encoder = text_encoder
@@ -138,8 +137,14 @@ class LongCatVideoAvatarPipeline:
         self._num_timesteps = 1000
         self._num_distill_sample_steps = 50
 
-        self.audio_encoder=audio_encoder
-        self.wav2vec_feature_extractor = wav2vec_feature_extractor
+        self.audio_encoder = audio_encoder
+        self.audio_feature_extractor = audio_feature_extractor
+
+        self.model_type = model_type
+        self.use_vcond = True
+        if self.model_type == "avatar-v1.5":
+            self.use_vcond = False
+            self._num_distill_sample_steps = 8
 
     def _get_t5_prompt_embeds(
         self,
@@ -373,14 +378,20 @@ class LongCatVideoAvatarPipeline:
         return self._attention_kwargs
     
     def get_timesteps_sigmas(self, sampling_steps: int, use_distill: bool=False):
-        if use_distill:
-            distill_indices = torch.arange(1, self.num_distill_sample_steps + 1, dtype=torch.float32)
-            distill_indices = (distill_indices * (self.num_timesteps // self.num_distill_sample_steps)).round().long()
+        if use_distill:            
+            if self.model_type == "avatar-v1.5":
+                distill_indices = torch.arange(1, self.num_distill_sample_steps + 1, dtype=torch.float32)
+                distill_indices = (distill_indices * (self.num_timesteps // self.num_distill_sample_steps)).round().long()
+                distill_indices = self.num_timesteps - distill_indices
+                sigmas = torch.flip(torch.linspace(0, 1, self.num_timesteps), [0])
+                sigmas = torch.flip(sigmas[distill_indices], [0]).float()
+            else:
+                distill_indices = torch.arange(1, self.num_distill_sample_steps + 1, dtype=torch.float32)
+                distill_indices = (distill_indices * (self.num_timesteps // self.num_distill_sample_steps)).round().long()
+                inference_indices = np.linspace(0, self.num_distill_sample_steps, num=sampling_steps, endpoint=False)
+                inference_indices = np.floor(inference_indices).astype(np.int64)
             
-            inference_indices = np.linspace(0, self.num_distill_sample_steps, num=sampling_steps, endpoint=False)
-            inference_indices = np.floor(inference_indices).astype(np.int64)
-            
-            sigmas = torch.flip(distill_indices, [0])[inference_indices].float() / self.num_timesteps
+                sigmas = torch.flip(distill_indices, [0])[inference_indices].float() / self.num_timesteps
         else:
             sigmas = torch.linspace(1, 0.001, sampling_steps)
         sigmas = sigmas.to(torch.float32)
@@ -524,8 +535,84 @@ class LongCatVideoAvatarPipeline:
         else:
             raise NotImplementedError(f"Not supported resize_mode {resize_mode}")
 
+    def get_audio_embedding(self, speech_array, fps=32, device='cpu', sample_rate=16000, model_type="avatar-v1.0"):
+        if model_type == "avatar-v1.0":
+            return self.get_audio_embedding_wav2vec2(speech_array, fps, device, sample_rate)
+        if model_type == "avatar-v1.5":
+            return self.get_audio_embedding_whisper(speech_array, fps, device, sample_rate)
+
     @torch.no_grad()
-    def get_audio_embedding(self, speech_array, fps=32, device='cpu', sample_rate=16000):
+    def get_audio_embedding_whisper(self, speech_array, fps=25, device='cpu', sample_rate=16000):
+        """使用 Whisper encoder 提取音频特征。
+        Args:
+            speech_array: 原始音频波形 (numpy array, 单声道, sample_rate=16000)
+            fps:          目标视频帧率
+            device:       推理设备
+            sample_rate:  音频采样率
+        Returns:
+            audio_emb: [T, 5, D]，T = int(audio_duration * fps)
+        """
+        def linear_interpolation_fps(features, input_fps, output_fps, output_len=None):
+            """将音频特征从 input_fps 插值到 output_fps。
+            Args:
+                features:   [B, T, D]
+                input_fps:  源帧率
+                output_fps: 目标帧率
+                output_len: 若指定则直接用该长度，否则按帧率比换算
+            Returns:
+                [B, output_len, D]
+            """
+            features = features.transpose(1, 2)   # [B, D, T]
+            if output_len is None:
+                output_len = int(features.shape[2] / float(input_fps) * output_fps)
+            output_features = F.interpolate(features, size=output_len, align_corners=True, mode='linear')
+            return output_features.transpose(1, 2)
+        # ---- 常量 ----
+        MEL_CHUNK      = 750 * 640   # feature extractor 滑窗大小（样本数）
+        ENC_CHUNK      = 3000        # encoder 滑窗大小（mel 帧数）
+        ENC_FPS        = 50          # encoder 输出帧率
+
+        # ---- 时长 / 帧数 ----
+        audio_duration = len(speech_array) / sample_rate
+        video_length   = int(audio_duration * fps)
+
+        # ---- 音频预处理 ----
+        speech_array = self._loudness_norm(speech_array, sample_rate)
+
+        # ---- Whisper feature extractor：wav → mel spectrogram ----
+        mel_chunks = []
+        for i in range(0, len(speech_array), MEL_CHUNK):
+            mel = self.audio_feature_extractor(
+                speech_array[i: i + MEL_CHUNK],
+                sampling_rate=sample_rate,
+                return_tensors="pt",
+            ).input_features                          # [1, mel_bins, T_mel]
+            mel_chunks.append(mel)
+        audio_features = torch.cat(mel_chunks, dim=-1)   # [1, mel_bins, T_mel_total]
+        audio_features = audio_features.to(self.audio_encoder.dtype)
+
+        # ---- Whisper encoder：mel → hidden states ----
+        enc_chunks = []
+        for i in range(0, audio_features.shape[-1], ENC_CHUNK):
+            chunk_hs = self.audio_encoder.encoder(
+                audio_features[:, :, i: i + ENC_CHUNK].to(device),
+                output_hidden_states=True,
+            ).hidden_states                           # tuple: (n_layers+1,) x [1, T_enc, D]
+            enc_chunks.append(torch.stack(chunk_hs, dim=2))  # [1, T_enc, n_layers, D]
+        audio_prompts = torch.cat(enc_chunks, dim=1)         # [1, T_enc_total, n_layers, D]
+        audio_prompts = audio_prompts[:, :video_length * 2]  # 截取有效帧
+
+        # ---- 按层分组 + 插值到目标帧数 ----
+        feat0 = linear_interpolation_fps(audio_prompts[:, :,  0: 8].mean(dim=2), ENC_FPS, fps, video_length)
+        feat1 = linear_interpolation_fps(audio_prompts[:, :,  8:16].mean(dim=2), ENC_FPS, fps, video_length)
+        feat2 = linear_interpolation_fps(audio_prompts[:, :, 16:24].mean(dim=2), ENC_FPS, fps, video_length)
+        feat3 = linear_interpolation_fps(audio_prompts[:, :, 24:32].mean(dim=2), ENC_FPS, fps, video_length)
+        feat4 = linear_interpolation_fps(audio_prompts[:, :, 32],                ENC_FPS, fps, video_length)
+        audio_emb = torch.stack([feat0, feat1, feat2, feat3, feat4], dim=2)[0]   # [T, 5, D]
+        return audio_emb
+    
+    @torch.no_grad()
+    def get_audio_embedding_wav2vec2(self, speech_array, fps=32, device='cpu', sample_rate=16000):
             
         audio_duration = len(speech_array) / sample_rate
         video_length = audio_duration * fps
@@ -537,7 +624,7 @@ class LongCatVideoAvatarPipeline:
 
         # wav2vec_feature_extractor
         audio_feature = np.squeeze(
-            self.wav2vec_feature_extractor(speech_array, sampling_rate=sample_rate).input_values
+            self.audio_feature_extractor(speech_array, sampling_rate=sample_rate).input_values
         )
         audio_feature = torch.from_numpy(audio_feature).float().to(device=device)
         audio_feature = audio_feature.unsqueeze(0)
@@ -711,7 +798,7 @@ class LongCatVideoAvatarPipeline:
         )
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
-
+        
         # 6. Denoising loop
         if context_parallel_util.get_cp_size() > 1:
             torch.distributed.barrier(group=context_parallel_util.get_cp_group())
@@ -923,6 +1010,7 @@ class LongCatVideoAvatarPipeline:
                 context_parallel_util.cp_broadcast(negative_prompt_attention_mask)
 
         audio_cond_embs = torch.cat([audio_emb] * num_videos_per_prompt, dim=0)
+        audio_num = audio_cond_embs.shape[0]
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
@@ -979,14 +1067,14 @@ class LongCatVideoAvatarPipeline:
                 timestep[:, :1] = 0
 
                 if self.do_classifier_free_guidance and ref_target_masks is not None:
-                    # Multitalk mode
+                    # Multitalk mode with CFG
                     noise_pred_uncond_text = self.dit(
                             hidden_states=latent_model_input[:1],
                             timestep=timestep[:1],
                             encoder_hidden_states=prompt_embeds[:1],
                             encoder_attention_mask=prompt_attention_mask[:1],
                             num_cond_latents=1,
-                            audio_embs=audio_cond_embs[:2],
+                            audio_embs=audio_cond_embs[:audio_num],
                             ref_target_masks=ref_target_masks
                         )
                     noise_pred_cond = self.dit(
@@ -995,19 +1083,21 @@ class LongCatVideoAvatarPipeline:
                             encoder_hidden_states=prompt_embeds[1:],
                             encoder_attention_mask=prompt_attention_mask[1:],
                             num_cond_latents=1,
-                            audio_embs=audio_cond_embs[2:],
+                            audio_embs=audio_cond_embs[audio_num:2*audio_num],
                             ref_target_masks=ref_target_masks
                         )
                     noise_pred = torch.cat([noise_pred_uncond_text, noise_pred_cond])
                 else:
                     # Singletalk mode
+                    # Multitalk mode without CFG (e.g. use_distill with scale=1.0)
                     noise_pred = self.dit(
                         hidden_states=latent_model_input,
                         timestep=timestep,
                         encoder_hidden_states=prompt_embeds,
                         encoder_attention_mask=prompt_attention_mask,
                         num_cond_latents=1,
-                        audio_embs=audio_cond_embs
+                        audio_embs=audio_cond_embs,
+                        ref_target_masks=ref_target_masks
                     )
 
                 if self.do_classifier_free_guidance:
@@ -1222,6 +1312,7 @@ class LongCatVideoAvatarPipeline:
                 context_parallel_util.cp_broadcast(negative_prompt_attention_mask)
 
         audio_cond_embs = torch.cat([audio_emb] * num_videos_per_prompt, dim=0)
+        audio_num = audio_cond_embs.shape[0]
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
@@ -1267,10 +1358,13 @@ class LongCatVideoAvatarPipeline:
             latents=latents,
             need_encode=False
         )
-        if context_parallel_util.get_cp_size() > 1:
-            context_parallel_util.cp_broadcast(latents)
 
         num_cond_latents = 1 + (num_cond_frames - 1) // self.vae_scale_factor_temporal
+        if not self.use_vcond:
+            latents[:, :, :num_cond_latents] = cond_videos_latents
+
+        if context_parallel_util.get_cp_size() > 1:
+            context_parallel_util.cp_broadcast(latents)
         
         # 6. Prepare ref_target_masks from source size to latent size
         if ref_target_masks is not None:
@@ -1311,7 +1405,7 @@ class LongCatVideoAvatarPipeline:
                     timestep[:, :num_cond_latents] = 0
                 
                 if self.do_classifier_free_guidance and ref_target_masks is not None:
-                    # Multitalk mode
+                    # Multitalk mode with CFG
                     noise_pred_uncond_text = self.dit(
                         hidden_states=latent_model_input[:1],
                         timestep=timestep[:1],
@@ -1319,7 +1413,7 @@ class LongCatVideoAvatarPipeline:
                         encoder_attention_mask=prompt_attention_mask[:1],
                         num_cond_latents=num_cond_latents, 
                         kv_cache_dict=kv_cache_dict,
-                        audio_embs=audio_cond_embs[:2], 
+                        audio_embs=audio_cond_embs[:audio_num], 
                         num_ref_latents=num_ref_latents, 
                         ref_img_index=ref_img_index,
                         mask_frame_range=mask_frame_range,
@@ -1332,7 +1426,7 @@ class LongCatVideoAvatarPipeline:
                         encoder_attention_mask=prompt_attention_mask[1:],
                         num_cond_latents=num_cond_latents,
                         kv_cache_dict=kv_cache_dict,
-                        audio_embs=audio_cond_embs[2:], 
+                        audio_embs=audio_cond_embs[audio_num:2*audio_num], 
                         num_ref_latents=num_ref_latents, 
                         ref_img_index=ref_img_index,
                         mask_frame_range=mask_frame_range,
@@ -1341,6 +1435,7 @@ class LongCatVideoAvatarPipeline:
                     noise_pred = torch.cat([noise_pred_uncond_text, noise_pred_cond])
                 else:
                     # Singletalk mode
+                    # Multitalk mode without CFG (e.g. use_distill with scale=1.0)
                     noise_pred = self.dit(
                         hidden_states=latent_model_input, 
                         timestep=timestep,
@@ -1351,7 +1446,8 @@ class LongCatVideoAvatarPipeline:
                         audio_embs=audio_cond_embs, 
                         num_ref_latents=num_ref_latents, 
                         ref_img_index=ref_img_index,
-                        mask_frame_range=mask_frame_range
+                        mask_frame_range=mask_frame_range,
+                        ref_target_masks=ref_target_masks
                     )
 
                 if self.do_classifier_free_guidance:

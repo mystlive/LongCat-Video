@@ -41,7 +41,8 @@ class LoRAModule(torch.nn.Module):
         super().__init__()
         self.lora_name = lora_name
         
-        assert org_module.__class__.__name__ == "Linear"
+        assert org_module.__class__.__name__ in ("Linear", "QuantizedLinear"), \
+            f"LoRA target must be Linear or QuantizedLinear, got {org_module.__class__.__name__}"
         in_dim = org_module.in_features
         out_dim = org_module.out_features
 
@@ -116,7 +117,7 @@ class LoRANetwork(torch.nn.Module):
             except Exception as e:
                 print(f"Cannot find module: {module_name}, error: {e}")
                 continue
-            if module.__class__.__name__ != "Linear":
+            if module.__class__.__name__ not in ("Linear", "QuantizedLinear"):
                 continue
 
             # 推断 n_seperate

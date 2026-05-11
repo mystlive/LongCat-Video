@@ -19,14 +19,14 @@ from longcat_video.pipeline_longcat_video_avatar import LongCatVideoAvatarPipeli
 from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
 from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
+from longcat_video.modules.quantization import load_quantized_dit
 from longcat_video.context_parallel import context_parallel_util
 
 # -------- avatar related --------
 import librosa
 import soundfile as sf
-from longcat_video.audio_process.wav2vec2 import Wav2Vec2ModelWrapper
+from longcat_video.audio_process import get_audio_encoder, get_audio_feature_extractor
 from longcat_video.audio_process.torch_utils import save_video_ffmpeg
-from transformers import Wav2Vec2FeatureExtractor
 from audio_separator.separator import Separator
 
 
@@ -78,7 +78,7 @@ def audio_prepare_multi(left_temp_vocal_path, right_temp_vocal_path, generate_du
         right_speech_array_ext = np.concatenate([np.zeros_like(left_speech_array), right_speech_array])
         merge_raw_speech = np.concatenate([left_raw_speech_array, np.zeros_like(right_raw_speech_array)]) + \
                             np.concatenate([np.zeros_like(left_raw_speech_array), right_raw_speech_array])
-    elif audio_type == 'para':        
+    elif audio_type == 'para':
         left_speech_array_ext = left_speech_array
         right_speech_array_ext = right_speech_array
         merge_raw_speech = left_raw_speech_array + right_raw_speech_array
@@ -109,12 +109,23 @@ def generate(args):
     resolution = args.resolution
     num_segments = max(1, args.num_segments)
     output_dir = args.output_dir
+    model_type = args.model_type
+    use_distill = args.use_distill
+    use_int8 = args.use_int8
+
+    if use_distill and model_type == "avatar-v1.5":
+        num_inference_steps = 8
+        text_guidance_scale = 1.0
+        audio_guidance_scale = 1.0
 
     # set up default inference params
     save_fps = 16
+    audio_stride = 2
+    if model_type == "avatar-v1.5":
+        save_fps = 25
+        audio_stride = 1
     num_frames = 93
     num_cond_frames = 13
-    audio_stride = 2
 
     if resolution == '480p':
         height, width = 480, 832
@@ -130,11 +141,14 @@ def generate(args):
     right_raw_speech_path = input_data['cond_audio'].get('person2', None)
     assert left_raw_speech_path is not None or right_raw_speech_path is not None, f"At least one speech is required."
     left_person_bbox, right_person_bbox = None, None
+    use_background_silent_audio = False
     if 'bbox' in input_data:
         # bbox: [left_y_min, left_x_min, left_y_max, left_x_max]
         # x and y coordinates correspond to the width and height dimensions, respectively
         left_person_bbox = input_data['bbox'].get('person1', None)
         right_person_bbox = input_data['bbox'].get('person2', None)
+        other_person_bbox = input_data['bbox'].get('others', None)
+        use_background_silent_audio = other_person_bbox is not None and len(other_person_bbox) > 0
     audio_type = 'para'
     if 'audio_type' in input_data:
         audio_type = input_data.get('audio_type', 'para')
@@ -158,15 +172,35 @@ def generate(args):
     tokenizer = AutoTokenizer.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="tokenizer", torch_dtype=torch.bfloat16)
     text_encoder = UMT5EncoderModel.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="text_encoder", torch_dtype=torch.bfloat16)
     vae = AutoencoderKLWan.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="vae", torch_dtype=torch.bfloat16)
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
-    dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_multi", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+    if model_type == "avatar-v1.0":
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(checkpoint_dir, '..', 'LongCat-Video'), subfolder="scheduler", torch_dtype=torch.bfloat16)
+    elif model_type == "avatar-v1.5":
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(checkpoint_dir, subfolder="scheduler", torch_dtype=torch.bfloat16)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}. Expected 'avatar-v1.0' or 'avatar-v1.5'.")
+    
+    if model_type == "avatar-v1.0":
+        dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="avatar_multi", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+    elif model_type == "avatar-v1.5":
+        if use_int8:
+            print("[INFO] Loading INT8 quantized DiT model...")
+            dit = load_quantized_dit(checkpoint_dir, subfolder="base_model_int8", cp_split_hw=cp_split_hw)
+        else:
+            dit = LongCatVideoAvatarTransformer3DModel.from_pretrained(checkpoint_dir, subfolder="base_model", cp_split_hw=cp_split_hw, torch_dtype=torch.bfloat16)
+        if use_distill:
+            distill_checkpoint_path = os.path.join(checkpoint_dir, 'lora', f'dmd_lora.safetensors')
+            if os.path.exists(distill_checkpoint_path):
+                dit.load_lora(distill_checkpoint_path, "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+                dit.enable_loras(["dmd"])
 
     # initialize audio models
-    wav2vec_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')    
-    audio_encoder = Wav2Vec2ModelWrapper(wav2vec_path).to(local_rank)
-    audio_encoder.feature_extractor._freeze_parameters()
+    if model_type == "avatar-v1.0":
+        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'chinese-wav2vec2-base')
+    elif model_type == "avatar-v1.5":
+        audio_model_checkpoint_path = os.path.join(checkpoint_dir, 'whisper-large-v3')
+    audio_encoder = get_audio_encoder(audio_model_checkpoint_path, model_type).to(local_rank)
+    audio_feature_extractor = get_audio_feature_extractor(audio_model_checkpoint_path, model_type)
 
-    wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path, local_files_only=True)
     vocal_separator_path = os.path.join(checkpoint_dir, 'vocal_separator/Kim_Vocal_2.onnx')
     audio_output_dir_temp = f"./audio_temp_file"
     os.makedirs(audio_output_dir_temp, exist_ok=True)
@@ -189,7 +223,8 @@ def generate(args):
         scheduler = scheduler,
         dit = dit,
         audio_encoder=audio_encoder,
-        wav2vec_feature_extractor=wav2vec_feature_extractor
+        audio_feature_extractor=audio_feature_extractor,
+        model_type=model_type
     )
     pipe.to(local_rank)
 
@@ -202,8 +237,10 @@ def generate(args):
     if cp_rank == 0:
         # extract vocal
         sr = 16000
-        left_temp_vocal_path = extract_vocal_from_speech(left_raw_speech_path, f"/tmp/temp_speech_{generate_random_uid()}_{global_rank}_vocal.wav", vocal_separator, audio_output_dir_temp)
-        right_temp_vocal_path = extract_vocal_from_speech(right_raw_speech_path, f"/tmp/temp_speech_{generate_random_uid()}_{global_rank}_vocal.wav", vocal_separator, audio_output_dir_temp)
+        left_temp_vocal_path  = os.path.join(audio_output_dir_temp, f"{generate_random_uid()}_left_temp_vocal.wav")
+        right_temp_vocal_path = os.path.join(audio_output_dir_temp, f"{generate_random_uid()}_right_temp_vocal.wav")
+        left_temp_vocal_path = extract_vocal_from_speech(left_raw_speech_path, left_temp_vocal_path, vocal_separator, audio_output_dir_temp)
+        right_temp_vocal_path = extract_vocal_from_speech(right_raw_speech_path, right_temp_vocal_path, vocal_separator, audio_output_dir_temp)
         
         # prepare each vocal and synthesize the sum audio
         generate_duration = num_frames / save_fps + (num_segments-1) * (num_frames-num_cond_frames) / save_fps
@@ -212,12 +249,15 @@ def generate(args):
         merge_speech_path = f"/tmp/temp_speech_{generate_random_uid()}_{global_rank}_merge.wav"
         sf.write(merge_speech_path, merge_speech, 16000)
 
-        left_full_audio_emb = pipe.get_audio_embedding(left_speech_array_ext, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr) 
-        right_full_audio_emb = pipe.get_audio_embedding(right_speech_array_ext, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr) 
+        left_full_audio_emb = pipe.get_audio_embedding(left_speech_array_ext, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr, model_type=model_type) 
+        right_full_audio_emb = pipe.get_audio_embedding(right_speech_array_ext, fps=save_fps*audio_stride, device=local_rank, sample_rate=sr, model_type=model_type) 
         if torch.isnan(left_full_audio_emb).any() or torch.isnan(right_full_audio_emb).any():
             raise ValueError(f"broken audio embedding with nan values")
-
+        if use_background_silent_audio:
+            back_full_audio_emb = pipe.get_audio_embedding(np.zeros_like(left_speech_array_ext), fps=save_fps*audio_stride, device=local_rank, sample_rate=sr, model_type=model_type)
         assert left_full_audio_emb.shape == right_full_audio_emb.shape, f"Inconsistent audio embedding shape."
+        if use_background_silent_audio:
+            assert left_full_audio_emb.shape == back_full_audio_emb.shape, f"Inconsistent audio embedding shape between speaker and background."
   
         if context_parallel_util.get_cp_size() > 1:
             full_audio_emb_shape_list = list(left_full_audio_emb.size())
@@ -225,6 +265,8 @@ def generate(args):
             context_parallel_util.cp_broadcast(full_audio_emb_tensor_shape_list)
             context_parallel_util.cp_broadcast(left_full_audio_emb)
             context_parallel_util.cp_broadcast(right_full_audio_emb)
+            if use_background_silent_audio:
+                context_parallel_util.cp_broadcast(back_full_audio_emb)
         
         if left_temp_vocal_path is not None and os.path.exists(left_temp_vocal_path):
             os.remove(left_temp_vocal_path)
@@ -239,6 +281,9 @@ def generate(args):
         context_parallel_util.cp_broadcast(left_full_audio_emb)
         right_full_audio_emb = torch.zeros(*full_audio_emb_shape_list, dtype=torch.float32, device=local_rank)
         context_parallel_util.cp_broadcast(right_full_audio_emb)
+        if use_background_silent_audio:
+            back_full_audio_emb = torch.zeros(*full_audio_emb_shape_list, dtype=torch.float32, device=local_rank)
+            context_parallel_util.cp_broadcast(back_full_audio_emb)
 
 
     indices = torch.arange(2 * 2 + 1) - 2
@@ -250,7 +295,10 @@ def generate(args):
     center_indices = torch.clamp(center_indices, min=0, max=left_full_audio_emb.shape[0]-1)
     left_audio_emb = left_full_audio_emb[center_indices][None,...].to(local_rank)
     right_audio_emb = right_full_audio_emb[center_indices][None,...].to(local_rank)
-    audio_embs = torch.cat([left_audio_emb, right_audio_emb])
+    audio_embs = [left_audio_emb, right_audio_emb]
+    if use_background_silent_audio:
+        audio_embs.append(back_full_audio_emb[center_indices][None,...].to(local_rank))
+    audio_embs = torch.cat(audio_embs)
 
 
     # ==============================
@@ -282,7 +330,14 @@ def generate(args):
     background_mask += human_mask1
     background_mask += human_mask2
     background_mask = torch.where(background_mask > 0, torch.tensor(0), torch.tensor(1))
-    ref_target_masks = torch.stack([human_mask1, human_mask2, background_mask], dim=0).to(local_rank)
+    total_mask = [human_mask1, human_mask2, background_mask]
+    if use_background_silent_audio:
+        for i in range(len(other_person_bbox)//4):
+            other_person_bbox_i = other_person_bbox[i*4:(i+1)*4]
+            other_person_mask = torch.zeros([src_height, src_width])
+            other_person_mask[other_person_bbox_i[0]:other_person_bbox_i[2], other_person_bbox_i[1]:other_person_bbox_i[3]] = 1
+            total_mask.append(other_person_mask)
+    ref_target_masks = torch.stack(total_mask, dim=0).to(local_rank)
     
     # generate video
     output_tuple = pipe.generate_ai2v(
@@ -297,7 +352,8 @@ def generate(args):
         output_type='both',
         generator=generator,
         audio_emb=audio_embs,
-        ref_target_masks=ref_target_masks
+        ref_target_masks=ref_target_masks,
+        use_distill=use_distill,
     )
     output, latent = output_tuple 
     output = output[0]
@@ -336,7 +392,10 @@ def generate(args):
         center_indices = torch.clamp(center_indices, min=0, max=left_full_audio_emb.shape[0]-1)
         left_audio_emb = left_full_audio_emb[center_indices][None,...].to(local_rank)
         right_audio_emb = right_full_audio_emb[center_indices][None,...].to(local_rank)
-        audio_embs = torch.cat([left_audio_emb, right_audio_emb])
+        audio_embs = [left_audio_emb, right_audio_emb]
+        if use_background_silent_audio:
+            audio_embs.append(back_full_audio_emb[center_indices][None,...].to(local_rank))
+        audio_embs = torch.cat(audio_embs)
         
         output_tuple = pipe.generate_avc(
             video=current_video,
@@ -354,12 +413,13 @@ def generate(args):
             output_type='both',
             use_kv_cache=True,
             offload_kv_cache=False,
-            enhance_hf=True,
+            enhance_hf=True if not use_distill else False,
             audio_emb=audio_embs,
             ref_latent=ref_latent,
             ref_img_index=ref_img_index,
             mask_frame_range=mask_frame_range,
-            ref_target_masks=ref_target_masks
+            ref_target_masks=ref_target_masks,
+            use_distill=use_distill,
         )
         output, latent = output_tuple
 
@@ -440,6 +500,20 @@ def _parse_args():
         "--checkpoint_dir",
         type=str,
         default="./weights/LongCat-Video-Avatar",
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="avatar-v1.0",
+    )
+    parser.add_argument(
+        "--use_distill",
+        action='store_true',
+    )
+    parser.add_argument(
+        "--use_int8",
+        action='store_true',
+        help="Load INT8 quantized DiT model for reduced VRAM usage"
     )
 
     args = parser.parse_args()
